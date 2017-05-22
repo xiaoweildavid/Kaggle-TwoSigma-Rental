@@ -1,0 +1,699 @@
+import numpy as np
+from scipy import sparse
+import pandas as pd
+import xgboost as xgb
+import re
+import string
+import time
+from bayes_opt import BayesianOptimization
+import seaborn as sns
+import matplotlib.pyplot as plt
+
+from sklearn import preprocessing, pipeline, metrics, model_selection
+from sklearn.feature_extraction.text import TfidfVectorizer, CountVectorizer
+from sklearn import feature_selection
+from itertools import product
+#%matplotlib inline 
+
+start = time.time()
+train_data = pd.read_json('./input/train.json')
+test_data = pd.read_json('./input/test.json')
+
+train_size = train_data.shape[0]
+
+# For testing the demo, # them when running.
+#train_data = train_data[:500]
+#test_data = test_data[:300]
+
+#info method provides information about dataset like 
+#total values in each column, null/not null, datatype, memory occupied etc
+train_data.info()
+
+### ... check for NAs
+train_data.isnull().sum()
+
+### Target variable exploration
+sns.countplot(train_data.interest_level, order=['low', 'medium', 'high']);
+plt.xlabel('Interest Level');
+plt.ylabel('Number of occurrences');
+
+### Most advertised buildings
+train_data['building_id'].value_counts().nlargest(10)
+
+### Rent interest graph of New-York
+sns.lmplot(x="longitude", y="latitude", fit_reg=False, hue='interest_level',
+           hue_order=['low', 'medium', 'high'], size=9, scatter_kws={'alpha':0.4,'s':30},
+           data=train_data[(train_data.longitude>train_data.longitude.quantile(0.005))
+                           &(train_data.longitude<train_data.longitude.quantile(0.995))
+                           &(train_data.latitude>train_data.latitude.quantile(0.005))                           
+                           &(train_data.latitude<train_data.latitude.quantile(0.995))]);
+plt.xlabel('Longitude');
+plt.ylabel('Latitude');
+
+plt.figure(figsize=(8, 10))
+plt.scatter(range(train_data.shape[0]), train_data["price"].values,color='purple')
+plt.title("Distribution of Price");
+
+# Looks like there are some outliers in price, column ,lets remove them first.
+ulimit = np.percentile(train_data['price'].values, 99)
+train_data['price'].ix[train_data['price']>ulimit] = ulimit
+
+
+plt.figure(figsize=(8, 10))
+plt.scatter(range(train_data.shape[0]), train_data["price"].values,color='purple')
+plt.ylabel("Price")
+plt.title("Distribution of Price");
+
+## Try finding out outliers.
+
+bedroom_0 = train_data.iloc[np.where(train_data['bedrooms']==0)]
+bedroom_0.iloc[np.where(bedroom_0['bathrooms']<1)]
+bedroom_0.sort('price')#.iloc[bedroom_0.shape[0]-2]['photos']
+
+train_data['target'] = train_data['interest_level'].apply(lambda x: 0 if x=='low' else 1 if x=='medium' else 2)
+train_data['low'] = train_data['interest_level'].apply(lambda x: 1 if x=='low' else 0)
+train_data['medium'] = train_data['interest_level'].apply(lambda x: 1 if x=='medium' else 0)
+train_data['high'] = train_data['interest_level'].apply(lambda x: 1 if x=='high' else 0)
+
+full_data=pd.concat([train_data,test_data])
+
+# My part: Adding average interests level on manager_id.
+managers = {}
+for ele in train_data['manager_id']:
+    managers[ele] = [0, 0, 0]
+
+for num,level in enumerate(full_data['interest_level']):
+    temp_manager_id = full_data['manager_id'].iloc[num]
+    if temp_manager_id in managers.keys():
+        if level == 'low':
+            managers[temp_manager_id][0] += 1
+        elif level == 'medium':
+            managers[temp_manager_id][1] += 1
+        else:
+            managers[temp_manager_id][2] += 1
+    else:
+        managers[temp_manager_id] = [np.nan,np.nan,np.nan]
+
+low = []
+medium = []
+high = []
+
+for ele in full_data['manager_id']:
+    temp = sum(managers[str(ele)])
+    low.append(managers[str(ele)][0]/temp)
+    medium.append(managers[str(ele)][1]/temp)
+    high.append(managers[str(ele)][2]/temp)
+
+full_data['interest_by_manager_low'] = low
+full_data['interest_by_manager_medium'] = medium
+full_data['interest_by_manager_high']  = high
+
+# My part: Adding the log(citing times of buildings).
+buildings = full_data['building_id'].unique()
+
+building_log_times = []
+buildings = full_data.groupby('building_id').size().to_dict()
+
+for ele in full_data['building_id']:
+    building_log_times.append(np.log10(buildings[str(ele)]))
+
+full_data['building_log_time'] = building_log_times
+
+num_vars = ['bathrooms','bedrooms','latitude','longitude','price', \
+            'interest_by_manager_low','interest_by_manager_medium', 'interest_by_manager_high','building_log_time' ]
+cat_vars = ['building_id','manager_id','display_address','street_address']
+text_vars = ['description','features']
+date_var = 'created'
+image_var = 'photos'
+id_var = 'listing_id'
+
+full_data['created_datetime'] = pd.to_datetime(full_data['created'], format="%Y-%m-%d %H:%M:%S")
+
+# full_data['created_year']=full_data['created_datetime'].apply(lambda x:x.year) ## low variant
+full_data['created_month']=full_data['created_datetime'].apply(lambda x:x.month)
+full_data['created_day']=full_data['created_datetime'].apply(lambda x:x.day)
+full_data['created_dayofweek']=full_data['created_datetime'].apply(lambda x:x.dayofweek)
+full_data['created_dayofyear']=full_data['created_datetime'].apply(lambda x:x.dayofyear)
+full_data['created_weekofyear']=full_data['created_datetime'].apply(lambda x:x.weekofyear)
+full_data['created_hour']=full_data['created_datetime'].apply(lambda x:x.hour)
+full_data['created_epoch']=full_data['created_datetime'].apply(lambda x:x.value//10**9)
+
+date_num_vars = ['created_month','created_dayofweek','created_dayofyear'
+                 ,'created_weekofyear','created_hour','created_epoch']
+
+# full_data['price']=full_data['price'].apply(np.log)
+
+full_data['rooms'] = full_data['bedrooms'] + full_data['bathrooms'] 
+full_data['num_of_photos'] = full_data['photos'].apply(lambda x:len(x))
+full_data['num_of_features'] = full_data['features'].apply(lambda x:len(x))
+full_data['len_of_desc'] = full_data['description'].apply(lambda x:len(x))
+full_data['words_of_desc'] = full_data['description'].apply(lambda x:len(re.sub('['+string.punctuation+']', '', x).split()))
+
+
+full_data['nums_of_desc'] = full_data['description']\
+        .apply(lambda x:re.sub('['+string.punctuation+']', '', x).split())\
+        .apply(lambda x: len([s for s in x if s.isdigit()]))
+        
+full_data['has_phone'] = full_data['description'].apply(lambda x:re.sub('['+string.punctuation+']', '', x).split())\
+        .apply(lambda x: [s for s in x if s.isdigit()])\
+        .apply(lambda x: len([s for s in x if len(str(s))==10]))\
+        .apply(lambda x: 1 if x>0 else 0)
+full_data['has_email'] = full_data['description'].apply(lambda x: 1 if '@renthop.com' in x else 0)
+
+additional_num_vars = ['rooms','num_of_photos','num_of_features','len_of_desc',
+                    'words_of_desc','has_phone','has_email']
+                    
+full_data['avg_word_len'] = full_data[['len_of_desc','words_of_desc']]\
+                                    .apply(lambda x: x[0]/x[1] if x[1]!=0 else 0, axis=1)
+    
+full_data['price_per_room'] = full_data[['price','rooms']].apply(lambda x: x[0]/x[1] if x[1]!=0 else 0, axis=1)
+full_data['price_per_bedroom'] = full_data[['price','bedrooms']].apply(lambda x: x[0]/x[1] if x[1]!=0 else 0, axis=1)
+full_data['price_per_bathroom'] = full_data[['price','bathrooms']].apply(lambda x: x[0]/x[1] if x[1]!=0 else 0, axis=1)
+full_data['price_per_photo'] = full_data[['price','num_of_photos']].apply(lambda x: x[0]/x[1] if x[1]!=0 else 0, axis=1)
+
+
+full_data['photos_per_room'] = full_data[['num_of_photos','rooms']].apply(lambda x: x[0]/x[1] if x[1]!=0 else 0, axis=1)
+
+interactive_num_vars = ['avg_word_len','price_per_room','price_per_bedroom','price_per_bathroom','price_per_photo',
+                        'photos_per_room']
+                        
+LBL = preprocessing.LabelEncoder()
+
+LE_vars=[]
+LE_map=dict()
+for cat_var in cat_vars:
+    print ("Label Encoding %s" % (cat_var))
+    LE_var=cat_var+'_le' # Create new index.
+    full_data[LE_var]=LBL.fit_transform(full_data[cat_var])
+    LE_vars.append(LE_var)
+    LE_map[cat_var]=LBL.classes_
+    
+print ("Label-encoded feaures: %s" % (LE_vars))
+
+OHE = preprocessing.OneHotEncoder(sparse=True)
+start=time.time()
+OHE.fit(full_data[LE_vars])
+OHE_sparse=OHE.transform(full_data[LE_vars])
+                                   
+print ('One-hot-encoding finished in %f seconds' % (time.time()-start))
+
+
+OHE_vars = [var[:-3] + '_' + str(level).replace(' ','_')\
+                for var in cat_vars for level in LE_map[var] ] # all 57868.
+
+print ("OHE_sparse size :" ,OHE_sparse.shape)
+print ("One-hot encoded catgorical feature samples : %s" % (OHE_vars[:100]))
+
+##Create a function to encode high-cardinality cateogrical features
+
+def designate_single_observations(df1, df2, column):
+    ps = df1[column].append(df2[column])
+    grouped = ps.groupby(ps).size().to_frame().rename(columns={0: "size"})
+    df1.loc[df1.join(grouped, on=column, how="left")["size"] <= 1, column] = -1
+    df2.loc[df2.join(grouped, on=column, how="left")["size"] <= 1, column] = -1
+    return df1, df2
+
+
+def hcc_encode(train_df, test_df, variable, target, prior_prob, k, f=1, g=1, r_k=None, update_df=None):
+    """
+    See "A Preprocessing Scheme for High-Cardinality Categorical Attributes in
+    Classification and Prediction Problems" by Daniele Micci-Barreca
+    """
+    hcc_name = "_".join(["hcc", variable, target])
+    print(hcc_name)
+
+    grouped = train_df.groupby(variable)[target].agg({"size": "size", "mean": "mean"})
+    print(grouped)
+    grouped["lambda"] = 1 / (g + np.exp((k - grouped["size"]) / f))
+    grouped[hcc_name] = grouped["lambda"] * grouped["mean"] + (1 - grouped["lambda"]) * prior_prob
+
+    df = test_df[[variable]].join(grouped, on=variable, how="left")[hcc_name].fillna(prior_prob)
+    if r_k: df *= np.random.uniform(1 - r_k, 1 + r_k, len(test_df))     # Add uniform noise. Not mentioned in original paper
+
+    if update_df is None: update_df = test_df
+    if hcc_name not in update_df.columns: update_df[hcc_name] = np.nan
+    update_df.update(df)
+    return
+    
+for col in ('building_id', 'manager_id', 'display_address'):
+    train_data, test_data = designate_single_observations(train_data, test_data, col)
+    
+prior_low, prior_medium, prior_high = train_data[["low", "medium", "high"]].mean() 
+
+skf = model_selection.StratifiedKFold(5)
+attributes = product(("building_id", "manager_id"), zip(("medium", "high"), (prior_medium, prior_high)))
+for variable, (target, prior) in attributes:
+    hcc_encode(train_data, test_data, variable, target, prior, k=5, r_k=None)
+    for train, test in skf.split(np.zeros(len(train_data)), train_data['interest_level']):
+        hcc_encode(train_data.iloc[train], train_data.iloc[test], variable, target, prior, k=5, r_k=0.01,
+                   update_df=train_data)
+        
+hcc_data = pd.concat([train_data[['building_id', 'manager_id', 'display_address',
+            'hcc_building_id_medium','hcc_building_id_high',
+            'hcc_manager_id_medium','hcc_manager_id_high']],
+           test_data[['building_id', 'manager_id', 'display_address',
+            'hcc_building_id_medium','hcc_building_id_high',
+            'hcc_manager_id_medium','hcc_manager_id_high']]
+           ]
+          )
+full_data['building_id'] = hcc_data['building_id']
+full_data['manager_id'] = hcc_data['manager_id']
+full_data['display_address'] = hcc_data['display_address']
+full_data['hcc_building_id_medium'] = hcc_data['hcc_building_id_medium']
+full_data['hcc_building_id_high'] = hcc_data['hcc_building_id_high']
+full_data['hcc_manager_id_medium'] = hcc_data['hcc_manager_id_medium']
+full_data['hcc_manager_id_high'] = hcc_data['hcc_manager_id_high']
+hcc_vars = ['hcc_building_id_medium','hcc_building_id_high','hcc_manager_id_medium','hcc_manager_id_high']    
+
+full_data.features.apply(lambda x: ' '.join(['_'.join(i.split(' ')) for i in x]))
+print(full_data['features'])
+cntvec = CountVectorizer(stop_words='english', max_features=200)
+feature_sparse =cntvec.fit_transform(full_data["features"]\
+                                     .apply(lambda x: " ".join(["_".join(i.split(" ")) for i in x])))
+
+feature_vars = ['feature_' + v for v in cntvec.vocabulary_]
+
+# tfidf = TfidfVectorizer(stop_words='english', max_features=10)
+# desc_sparse = tfidf.fit_transform(full_data["description"])
+# desc_vars = ['desc_' + v for v in tfidf.get_feature_names()]
+
+cntvec = CountVectorizer(stop_words='english', max_features=100)
+desc_sparse = cntvec.fit_transform(full_data["description"])
+desc_vars = ['desc_' + v for v in cntvec.vocabulary_]
+
+cntvec = CountVectorizer(stop_words='english', max_features=10)
+st_addr_sparse = cntvec.fit_transform(full_data["street_address"])
+st_addr_vars = ['desc_' + v for v in cntvec.vocabulary_]
+
+price_by_manager = full_data.groupby('manager_id')['price'].agg([np.min,np.max,np.median,np.mean]).reset_index()
+price_by_manager.columns = ['manager_id','min_price_by_manager',
+                            'max_price_by_manager','median_price_by_manager','mean_price_by_manager']
+full_data = pd.merge(full_data,price_by_manager, how='left',on='manager_id')
+
+price_by_building = full_data.groupby('building_id')['price'].agg([np.min,np.max,np.median,np.mean]).reset_index()
+price_by_building.columns = ['building_id','min_price_by_building',
+                            'max_price_by_building','median_price_by_building','mean_price_by_building']
+full_data = pd.merge(full_data,price_by_building, how='left',on='building_id')
+
+price_by_disp_addr = full_data.groupby('display_address')['price'].agg([np.min,np.max,np.median,np.mean]).reset_index()
+price_by_disp_addr.columns = ['display_address','min_price_by_disp_addr',
+                            'max_price_by_disp_addr','median_price_by_disp_addr','mean_price_by_disp_addr']
+full_data = pd.merge(full_data,price_by_disp_addr, how='left',on='display_address')
+
+num_cat_vars = ['median_price_by_manager','mean_price_by_manager',
+                'median_price_by_building','mean_price_by_building',
+                'median_price_by_disp_addr','mean_price_by_disp_addr'
+               ]
+
+full_data['price_percentile_by_manager']=\
+            full_data[['price','min_price_by_manager','max_price_by_manager']]\
+            .apply(lambda x:(x[0]-x[1])/(x[2]-x[1]) if (x[2]-x[1])!=0 else 0.5,
+                  axis=1)
+full_data['price_percentile_by_building']=\
+            full_data[['price','min_price_by_building','max_price_by_building']]\
+            .apply(lambda x:(x[0]-x[1])/(x[2]-x[1]) if (x[2]-x[1])!=0 else 0.5,
+                  axis=1)
+full_data['price_percentile_by_disp_addr']=\
+            full_data[['price','min_price_by_disp_addr','max_price_by_disp_addr']]\
+            .apply(lambda x:(x[0]-x[1])/(x[2]-x[1]) if (x[2]-x[1])!=0 else 0.5,
+                  axis=1)
+
+num_cat_vars.append('price_percentile_by_manager')
+num_cat_vars.append('price_percentile_by_building')
+num_cat_vars.append('price_percentile_by_disp_addr')
+
+min_listing_id = full_data['listing_id'].min()
+max_listing_id = full_data['listing_id'].max()
+full_data['listing_id_pos']=full_data['listing_id'].apply(lambda x:np.float64((x-min_listing_id+1))/(max_listing_id-min_listing_id+1))
+num_vars.append('listing_id')
+num_vars.append('listing_id_pos')
+
+##Baseline with features from "features" and street address
+
+full_vars = num_vars + date_num_vars + additional_num_vars + interactive_num_vars + LE_vars + hcc_vars + num_cat_vars
+
+train_x = sparse.hstack([full_data[full_vars], feature_sparse,st_addr_sparse]).tocsr()[:train_size]
+train_y = full_data['target'][:train_size].values
+
+test_x = sparse.hstack([full_data[full_vars], feature_sparse,st_addr_sparse]).tocsr()[train_size:]
+test_y = full_data['target'][train_size:].values
+
+
+full_vars = full_vars + feature_vars + st_addr_vars
+print ("training data size: ", train_x.shape,"testing data size: ", test_x.shape)
+
+params = dict()
+params['objective'] = 'multi:softprob'
+params['num_class'] = 3
+params['eta'] = 0.1
+params['max_depth'] = 6
+params['min_child_weight'] = 1
+params['subsample'] = 0.7
+params['colsample_bytree'] = 0.7
+params['gamma'] = 1
+params['seed']=1234
+
+cv_results = xgb.cv(params, xgb.DMatrix(train_x, label=train_y.reshape(train_x.shape[0],1)),
+               num_boost_round=1000000, nfold=5,
+       metrics={'mlogloss'},
+       seed=1234,
+       callbacks=[xgb.callback.early_stop(50)])
+       
+import lightgbm as lgb
+
+lgb_train = lgb.Dataset(train_x, train_y)
+
+def lgb_evaluate(max_bins,
+                 num_leaves,
+                 min_sum_hessian_in_leaf,
+                 min_gain_to_split,
+                 feature_fraction,
+                 bagging_fraction,
+                 bagging_freq
+                 ):
+    params = dict()
+    params['objective'] = 'multiclass'
+    params['num_class'] = 3
+    params['learning_rate'] = 0.1
+    params['max_bins'] = int(max_bins)   
+    params['num_leaves'] = int(num_leaves)    
+    params['min_sum_hessian_in_leaf'] = min_sum_hessian_in_leaf
+    params['min_gain_to_split'] = int(min_gain_to_split)    
+    params['feature_fraction'] = feature_fraction
+    params['bagging_fraction'] = bagging_fraction
+    params['bagging_freq'] = int(bagging_freq)
+
+
+    cv_results = lgb.cv(params,
+                    lgb_train,
+                    num_boost_round=100000,
+                    nfold=5,
+                    early_stopping_rounds=100,
+                    metrics='multi_logloss',
+                    verbose_eval=False
+                   )
+
+    return -pd.DataFrame(cv_results)['multi_logloss-mean'].min()
+
+
+lgb_BO = BayesianOptimization(lgb_evaluate, 
+                             {'max_bins': (127, 1023),
+                              'num_leaves': (15, 512),
+                              'min_sum_hessian_in_leaf': (1, 100),
+                              'min_gain_to_split': (0,2),
+                              'feature_fraction': (0.2, 0.8),
+                              'bagging_fraction': (0.7, 1),
+                              'bagging_freq': (1, 5)
+                             }
+                            )
+
+lgb_BO.maximize(init_points=5, n_iter=30)
+
+## Show tuning results
+lgb_BO_scores = pd.DataFrame(lgb_BO.res['all']['params'])
+lgb_BO_scores['score'] = pd.DataFrame(lgb_BO.res['all']['values'])
+lgb_BO_scores = lgb_BO_scores.sort_values(by='score',ascending=False)
+lgb_BO_scores.head()
+
+# LightGBM
+lgb_clfs = []
+for p in lgb_BO_scores.head(4).iterrows():
+    lgb_clfs.append(lgb.LGBMClassifier(n_estimators = 10000,
+                                    learning_rate=0.01,
+                                    max_bin=int(p[1].to_dict()['max_bins']),
+                                    num_leaves=int(p[1].to_dict()['num_leaves']),
+                                    min_child_weight=int(p[1].to_dict()['min_sum_hessian_in_leaf']),
+                                    colsample_bytree=p[1].to_dict()['feature_fraction'],
+                                    subsample=p[1].to_dict()['bagging_fraction'],
+                                    subsample_freq=int(p[1].to_dict()['bagging_freq']),
+                                    min_split_gain=p[1].to_dict()['min_gain_to_split'],
+                                    seed=1234,
+                                    nthread=-1)
+                )
+
+# # XGBoost    
+# xgb_clfs = []
+# for p in BO_scores.head(5).iterrows():
+#     clfs.append(xgb.XGBClassifier(n_estimators = 462,
+#                                   learning_rate=0.1,
+#                                   max_depth=int(p[1].to_dict()['max_depth']),
+#                                   min_child_weight=int(p[1].to_dict()['min_child_weight']),
+#                                   colsample_bytree=p[1].to_dict()['colsample_bytree'],
+#                                   subsample=p[1].to_dict()['subsample'],
+#                                   gamma=p[1].to_dict()['gamma'],
+#                                   seed=1234,
+#                                   nthread=-1))
+
+
+skf = model_selection.StratifiedKFold(n_splits=5, random_state=2017)
+temp = list(skf.split(train_x, train_y))
+temp[0]
+
+def blend_model(clfs, train_x, train_y, test_x, num_class, blend_folds):
+
+    skf = model_selection.StratifiedKFold(n_splits=blend_folds,random_state=1234)
+    skf_ids = list(skf.split(train_x, train_y))
+
+
+    train_blend_x = np.zeros((train_x.shape[0], len(clfs)*num_class))
+    test_blend_x = np.zeros((test_x.shape[0], len(clfs)*num_class))
+    blend_scores = np.zeros ((blend_folds,len(clfs)))
+
+    print  ("Start blending.")
+    for j, clf in enumerate(clfs):
+        print ("Blending model",j+1, clf)
+        test_blend_x_j = np.zeros((test_x.shape[0], num_class))
+        for i, (train_ids, val_ids) in enumerate(skf_ids):
+            print ("Model %d fold %d" %(j+1,i+1))
+            train_x_fold = train_x[train_ids]
+            train_y_fold = train_y[train_ids]
+            val_x_fold = train_x[val_ids]
+            val_y_fold = train_y[val_ids]
+            # Set n_estimators to a large number for early_stopping
+            clf.n_estimators = 10000000
+            
+            # Set evaluation metric
+            if type(clf).__name__=='LGBMClassifier':
+                metric = 'logloss' #LightGBM
+            else:
+                metric = 'mlogloss' #XGBoost            
+            clf.fit(train_x_fold, train_y_fold,
+                    eval_set=[(val_x_fold,val_y_fold)],
+                    eval_metric=metric,
+                    early_stopping_rounds=500,verbose=False)
+            val_y_predict_fold = clf.predict_proba(val_x_fold)
+            score = metrics.log_loss(val_y_fold,val_y_predict_fold)
+            print ("LOGLOSS: ", score)
+            print ("Best Iteration:", clf.best_iteration)
+            blend_scores[i,j]=score
+            train_blend_x[val_ids, j*num_class:j*num_class+num_class] = val_y_predict_fold
+            test_blend_x_j = test_blend_x_j + clf.predict_proba(test_x)
+        test_blend_x[:,j*num_class:j*num_class+num_class] = test_blend_x_j/blend_folds
+        print ("Score for model %d is %f" % (j+1,np.mean(blend_scores[:,j])))
+    return train_blend_x, test_blend_x, blend_scores
+    
+    
+train_blend_x_lgb, test_blend_x_lgb, blend_scores_lgb = blend_model(lgb_clfs, 
+                                                        train_x, 
+                                                        train_y, 
+                                                        test_x, 
+                                                        num_class=3, 
+                                                        blend_folds=4)
+from sklearn.linear_model import LogisticRegression,RidgeClassifier
+from sklearn.neural_network import MLPClassifier
+def search_model(train_x, train_y, est, param_grid, n_jobs, cv, refit=False):
+##Grid Search for the best model
+    model = model_selection.GridSearchCV(estimator  = est,
+                                     param_grid = param_grid,
+                                     scoring    = 'log_loss',
+                                     verbose    = 10,
+                                     n_jobs  = n_jobs,
+                                     iid        = True,
+                                     refit    = refit,
+                                     cv      = cv)
+    # Fit Grid Search Model
+    model.fit(train_x, train_y)
+    print("Best score: %0.3f" % model.best_score_)
+    print("Best parameters set:", model.best_params_)
+    print("Scores:", model.grid_scores_)
+    return model
+    
+import keras
+from keras.models import Sequential
+from keras.layers import Dense, Activation
+
+KerasModel = Sequential()
+KerasModel.add(Dense(32, activation='relu'))
+KerasModel.add(Dense(64, activation='relu'))
+KerasModel.add(Dense(32, activation='relu'))
+KerasModel.compile(optimizer='sgd',loss='binary_crossentropy')
+
+KerasModel.fit(train_blend_x_lgb, train_y,epochs=20,batch_size=32)
+preds = KerasModel(test_blend_xgb)
+
+param_grid = {"hidden_layer_sizes":list(range(5,201,5))
+              }
+model = search_model(train_blend_x_lgb
+                                         , train_y
+                                         , MLPClassifier()
+                                         , param_grid
+                                         , n_jobs=-1
+                                         , cv=4
+                                         , refit=True)   
+
+print ("best subsample:", model.best_params_, '\n')
+
+
+preds = model.predict_proba(test_blend_x_lgb)
+sub_df = pd.DataFrame(preds,columns = ["low", "medium", "high"])
+sub_df["listing_id"] = test_data.listing_id.values
+sub_df.to_csv("./output/XW1_L1LGB_L2MLP_blended_results.csv", index=False)
+
+train_blend_x = sparse.hstack([train_x, train_blend_x_lgb]).tocsr()
+test_blend_x = sparse.hstack([test_x, test_blend_x_lgb]).tocsr()
+
+params = dict()
+params['objective'] = 'multi:softprob'
+params['num_class'] = 3
+params['eta'] = 0.01
+params['max_depth'] = 7
+params['min_child_weight'] = 15
+params['subsample'] = 0.7 # Was 1 in Chris version.
+params['colsample_bytree'] = 0.6 # Was 0.33
+params['gamma'] = 0.35
+params['seed']=1234
+
+cv_results = xgb.cv(params, xgb.DMatrix(train_blend_x, label=train_y.reshape(train_x.shape[0],1)),
+               num_boost_round=1000000, nfold=5,
+       metrics={'mlogloss'},
+       seed=1234,
+       callbacks=[xgb.callback.early_stop(50)])
+
+best_xgb_score = cv_results['test-mlogloss-mean'].min()
+best_xgb_iteration = len(cv_results)
+
+clf = xgb.XGBClassifier(learning_rate = 0.01
+                  , n_estimators =best_xgb_iteration
+                  , max_depth = 7
+                  , min_child_weight = 15
+                  , subsample = 0.7 # Was 1.
+                  , colsample_bytree = 0.6 # Was 0.33.
+                  , gamma = 0.35
+                  , seed = 1234
+                  , nthread = -1
+                  )
+
+clf.fit(train_blend_x, train_y)
+
+preds = clf.predict_proba(test_blend_x)
+sub_df = pd.DataFrame(preds,columns = ["low", "medium", "high"])
+sub_df["listing_id"] = test_data.listing_id.values
+sub_df.to_csv("./output/XW2_L1lgb_L2XGB_blended_and_original.csv", index=False)
+
+from bayes_opt import BayesianOptimization
+
+xgtrain = xgb.DMatrix(train_x, label=train_y.reshape(train_x.shape[0],1))
+
+def xgb_evaluate(min_child_weight,
+                 colsample_bytree,
+                 max_depth,
+                 subsample,
+                 gamma):
+    params = dict()
+    params['objective'] = 'multi:softprob'
+    params['num_class'] = 3
+    params['eta'] = 0.1
+    params['max_depth'] = int(max_depth )   
+    params['min_child_weight'] = int(min_child_weight)
+    params['colsample_bytree'] = colsample_bytree
+    params['subsample'] = subsample
+    params['gamma'] = gamma
+    params['verbose_eval'] = True    
+
+
+    cv_result = xgb.cv(params, xgtrain,
+                       num_boost_round=100000,
+                       nfold=5,
+                       metrics={'mlogloss'},
+                       seed=1234,
+                       callbacks=[xgb.callback.early_stop(50)])
+
+    return -cv_result['test-mlogloss-mean'].min()
+
+
+xgb_BO = BayesianOptimization(xgb_evaluate, 
+                             {'max_depth': (4, 8),
+                              'min_child_weight': (0, 100),
+                              'colsample_bytree': (0.2, 0.7),
+                              'subsample': (0.2, 1),
+                              'gamma': (0, 2)
+                             }
+                            )
+
+xgb_BO.maximize(init_points=5, n_iter=40)
+
+## Show tuning results
+xgb_BO_scores = pd.DataFrame(xgb_BO.res['all']['params'])
+xgb_BO_scores['score'] = pd.DataFrame(xgb_BO.res['all']['values'])
+xgb_BO_scores = xgb_BO_scores.sort_values(by='score',ascending=False)
+xgb_BO_scores.head()
+
+xgb_clfs = []
+for p in xgb_BO_scores.head(4).iterrows():
+    xgb_clfs.append(xgb.XGBClassifier(n_estimators = 10000,
+                                  learning_rate=0.01,
+                                  max_depth=int(p[1].to_dict()['max_depth']),
+                                  min_child_weight=int(p[1].to_dict()['min_child_weight']),
+                                  colsample_bytree=p[1].to_dict()['colsample_bytree'],
+                                  subsample=p[1].to_dict()['subsample'],
+                                  gamma=p[1].to_dict()['gamma'],
+                                  seed=1234,
+                                  nthread=-1))
+                                  
+train_blend_x_xgb, test_blend_x_xgb, blend_scores_xgb = blend_model(xgb_clfs, 
+                                                        train_x, 
+                                                        train_y, 
+                                                        test_x, 
+                                                        num_class=3, 
+                                                        blend_folds=4)
+                                                        
+train_blend_x = sparse.hstack([train_x, train_blend_x_lgb,train_blend_x_xgb]).tocsr()
+test_blend_x = sparse.hstack([test_x, test_blend_x_lgb,test_blend_x_xgb]).tocsr()
+
+params = dict()
+params['objective'] = 'multi:softprob'
+params['num_class'] = 3
+params['eta'] = 0.01
+params['max_depth'] = 7
+params['min_child_weight'] = 15
+params['subsample'] = 0.3 # Was 1
+params['colsample_bytree'] = 0.6 # Was 0.33
+params['gamma'] = 0.35
+params['seed']=1234
+
+cv_results = xgb.cv(params, xgb.DMatrix(train_blend_x, label=train_y.reshape(train_x.shape[0],1)),
+               num_boost_round=1000000, nfold=5,
+       metrics={'mlogloss'},
+       seed=1234,
+       callbacks=[xgb.callback.early_stop(50)])
+
+best_xgb_score = cv_results['test-mlogloss-mean'].min()
+best_xgb_iteration = len(cv_results)
+
+clf = xgb.XGBClassifier(learning_rate = 0.01
+                  , n_estimators =best_xgb_iteration
+                  , max_depth = 7
+                  , min_child_weight = 15
+                  , subsample = 0.3# Was 1
+                  , colsample_bytree = 0.6 # Was 0.33
+                  , gamma = 0.35
+                  , seed = 1234
+                  , nthread = -1
+                  )
+
+clf.fit(train_blend_x, train_y)
+
+preds = clf.predict_proba(test_blend_x)
+sub_df = pd.DataFrame(preds,columns = ["low", "medium", "high"])
+sub_df["listing_id"] = test_data.listing_id.values
+sub_df.to_csv("./output/XW3_L1lgb_xgb_L2xgb_blended_and_original.csv", index=False)
